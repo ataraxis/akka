@@ -53,6 +53,11 @@ class Journal(queuePath: String, syncJournal: ⇒ Boolean, log: LoggingAdapter) 
   private val byteBuffer = ByteBuffer.wrap(buffer)
   byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
+  private val queueBackupFile = new File(queuePath + "~~backup")
+  // in the unlikely event that the process exited without renaming the rolled temp file, restore the back up
+  if (isWindows && queueBackupFile.exists && !queueFile.exists)
+    queueBackupFile.renameTo(queueFile)
+
   private val CMD_ADD = 0
   private val CMD_REMOVE = 1
   private val CMD_ADDX = 2
@@ -63,6 +68,8 @@ class Journal(queuePath: String, syncJournal: ⇒ Boolean, log: LoggingAdapter) 
   private val CMD_ADD_XID = 7
 
   private def open(file: File) {
+    if (writer != null)
+      writer.close
     writer = new FileOutputStream(file, true).getChannel
   }
 
@@ -71,7 +78,7 @@ class Journal(queuePath: String, syncJournal: ⇒ Boolean, log: LoggingAdapter) 
   }
 
   def roll(xid: Int, openItems: List[QItem], queue: Iterable[QItem]) {
-    writer.close
+    close
     val tmpFile = new File(queuePath + "~~" + System.currentTimeMillis)
     open(tmpFile)
     size = 0
@@ -85,9 +92,29 @@ class Journal(queuePath: String, syncJournal: ⇒ Boolean, log: LoggingAdapter) 
     }
     if (syncJournal) writer.force(false)
     writer.close
-    tmpFile.renameTo(queueFile)
+    renameToQueueFile(tmpFile)
     open
   }
+
+  // File.renameTo() is not successful on Windows if the destination file already exists, so move it out of the way first
+  private def renameToQueueFile(tmpFile: File) {
+    if (isWindows) {
+      if (queueFile.exists) {
+        queueFile.renameTo(queueBackupFile)
+      }
+      if (tmpFile.renameTo(queueFile))
+        queueBackupFile.delete()
+      else {
+        log.error("File rolling failed for '{}'", tmpFile)
+        // didn't work ... oh well, clean up the mess
+        tmpFile.delete()
+      }
+    } else {
+      tmpFile.renameTo(queueFile)
+    }
+  }
+
+  private def isWindows = System.getProperty("os.name").toLowerCase.contains("win")
 
   def close() {
     writer.close
@@ -203,6 +230,8 @@ class Journal(queuePath: String, syncJournal: ⇒ Boolean, log: LoggingAdapter) 
         case e: BrokenItemException ⇒
           log.error(e, "Exception replaying journal for '{}'", name)
           truncateJournal(e.lastValidPosition)
+      } finally {
+        in.close()
       }
     } catch {
       case e: FileNotFoundException ⇒
